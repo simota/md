@@ -8,6 +8,49 @@ Terminal Markdown viewer written in Go. Single-binary friendly.
 go install github.com/simota/md/cmd/md@latest
 ```
 
+## Install (binaries from GitHub Releases)
+
+If you don't want to install Go, download a prebuilt binary from GitHub Releases.
+
+Release assets are named like:
+
+- `md_<VERSION>_<GOOS>_<ARCH>.tar.gz` (Linux/macOS)
+- `md_<VERSION>_<GOOS>_<ARCH>.zip` (Windows)
+- `md_<VERSION>_checksums.txt` (SHA-256 checksums for all assets)
+
+### macOS / Linux
+
+```bash
+# Pick a version and platform.
+VERSION=v0.1.0
+GOOS=darwin   # or linux
+ARCH=arm64    # or amd64, armv7
+
+ASSET="md_${VERSION}_${GOOS}_${ARCH}.tar.gz"
+
+curl -fL -o "${ASSET}" "https://github.com/simota/md/releases/download/${VERSION}/${ASSET}"
+curl -fL -o "md_${VERSION}_checksums.txt" "https://github.com/simota/md/releases/download/${VERSION}/md_${VERSION}_checksums.txt"
+
+# Verify checksum (pick one depending on your OS).
+grep " ${ASSET}\$" "md_${VERSION}_checksums.txt" | sha256sum -c -  # Linux
+# grep " ${ASSET}\$" "md_${VERSION}_checksums.txt" | shasum -a 256 -c -  # macOS
+
+tar -xzf "${ASSET}"
+
+# Install (no sudo): make sure ~/.local/bin is in PATH
+mkdir -p "${HOME}/.local/bin"
+install -m 0755 md "${HOME}/.local/bin/md"
+
+# Or install system-wide:
+# sudo install -m 0755 md /usr/local/bin/md
+```
+
+### Windows
+
+1. Download the matching `md_<VERSION>_windows_<ARCH>.zip` from GitHub Releases.
+2. Extract `md.exe`.
+3. Put it somewhere in your `PATH` (e.g. `C:\Users\<you>\bin`) and restart your terminal.
+
 ## Usage
 
 ```bash
