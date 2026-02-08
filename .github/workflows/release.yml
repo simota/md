@@ -1,0 +1,125 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.13"
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          BIN="md"
+          if [ "${GOOS}" = "windows" ]; then
+            BIN="md.exe"
+          fi
+
+          go build -trimpath -ldflags="-s -w" -o "dist/${BIN}" ./cmd/md
+
+      - name: Package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          ARCHIVE: ${{ matrix.archive }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          ARCH="${GOARCH}"
+          if [ "${GOARCH}" = "arm" ] && [ -n "${GOARM}" ]; then
+            ARCH="armv${GOARM}"
+          fi
+
+          NAME="md_${VERSION}_${GOOS}_${ARCH}"
+
+          if [ "${GOOS}" = "windows" ]; then
+            (cd dist && zip -9 "../${NAME}.zip" "md.exe")
+            echo "ASSET=${NAME}.zip" >> "$GITHUB_ENV"
+          else
+            (cd dist && tar -czf "../${NAME}.tar.gz" "md")
+            echo "ASSET=${NAME}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum md_${VERSION}_* > md_${VERSION}_checksums.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+          generate_release_notes: true
