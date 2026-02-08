@@ -1,0 +1,4 @@
+/md
+/dist/
+*.test
+.agents
