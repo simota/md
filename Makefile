@@ -1,48 +1,45 @@
 BINARY := md
-PKG := ./cmd/md
-
-GO ?= go
+CARGO ?= cargo
 
 .PHONY: test build install clean dist
 
 test:
-	$(GO) test ./...
+	$(CARGO) test
 
 build:
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags="-s -w" -o $(BINARY) $(PKG)
+	$(CARGO) build --release
 
 install:
-	CGO_ENABLED=0 $(GO) install $(PKG)
+	$(CARGO) install --path .
 
 clean:
-	rm -rf dist $(BINARY)
+	$(CARGO) clean
+	rm -rf dist
 
 # Local packaging helper (mirrors GitHub Actions naming).
 # Usage:
 #   make dist VERSION=v0.1.0
-dist: clean
+dist:
 	@if [ -z "$(VERSION)" ]; then echo "VERSION is required (e.g. VERSION=v0.1.0)"; exit 2; fi
 	@mkdir -p dist
 	@set -e; \
 	for target in \
-		"linux/amd64/tar.gz" \
-		"linux/arm64/tar.gz" \
-		"linux/armv7/tar.gz" \
-		"darwin/amd64/tar.gz" \
-		"darwin/arm64/tar.gz" \
-		"windows/amd64/zip" \
-		"windows/arm64/zip" \
+		"x86_64-unknown-linux-gnu/linux/amd64/tar.gz" \
+		"aarch64-unknown-linux-gnu/linux/arm64/tar.gz" \
+		"x86_64-apple-darwin/darwin/amd64/tar.gz" \
+		"aarch64-apple-darwin/darwin/arm64/tar.gz" \
+		"x86_64-pc-windows-msvc/windows/amd64/zip" \
+		"aarch64-pc-windows-msvc/windows/arm64/zip" \
 	; do \
-		GOOS="$${target%%/*}"; rest="$${target#*/}"; \
-		GOARCH="$${rest%%/*}"; rest="$${rest#*/}"; \
+		TARGET="$${target%%/*}"; rest="$${target#*/}"; \
+		GOOS="$${rest%%/*}"; rest="$${rest#*/}"; \
+		ARCH="$${rest%%/*}"; rest="$${rest#*/}"; \
 		ARCHIVE="$${rest}"; \
-		GOARM=""; ARCH="$${GOARCH}"; \
-		if [ "$${GOARCH}" = "armv7" ]; then GOARCH="arm"; GOARM="7"; ARCH="armv7"; fi; \
 		OUT="dist/$(BINARY)_$(VERSION)_$${GOOS}_$${ARCH}"; \
-		echo "==> $${GOOS}/$${ARCH}"; \
+		echo "==> $${TARGET}"; \
 		BIN="$(BINARY)"; if [ "$${GOOS}" = "windows" ]; then BIN="$(BINARY).exe"; fi; \
-		CGO_ENABLED=0 GOOS="$${GOOS}" GOARCH="$${GOARCH}" GOARM="$${GOARM}" \
-			$(GO) build -trimpath -ldflags="-s -w" -o "dist/$${BIN}" $(PKG); \
+		$(CARGO) build --release --target "$${TARGET}"; \
+		cp "target/$${TARGET}/release/$${BIN}" "dist/$${BIN}"; \
 		if [ "$${GOOS}" = "windows" ]; then \
 			(cd dist && zip -9 "../$${OUT}.zip" "$${BIN}"); \
 		else \
@@ -51,4 +48,3 @@ dist: clean
 		rm -f "dist/$${BIN}"; \
 	done
 	@cd dist && shasum -a 256 $(BINARY)_$(VERSION)_* > $(BINARY)_$(VERSION)_checksums.txt
-

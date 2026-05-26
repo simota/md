@@ -7,87 +7,91 @@ on:
 
 jobs:
   build:
-    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
-    runs-on: ubuntu-latest
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: amd64
             archive: tar.gz
-          - goos: linux
-            goarch: arm64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            os: linux
+            arch: arm64
             archive: tar.gz
-          - goos: linux
-            goarch: arm
-            goarm: "7"
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            os: darwin
+            arch: amd64
             archive: tar.gz
-          - goos: darwin
-            goarch: amd64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            os: darwin
+            arch: arm64
             archive: tar.gz
-          - goos: darwin
-            goarch: arm64
-            archive: tar.gz
-          - goos: windows
-            goarch: amd64
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            arch: amd64
             archive: zip
-          - goos: windows
-            goarch: arm64
+          - target: aarch64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            arch: arm64
             archive: zip
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: "1.24.13"
-          cache: true
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Test
-        run: go test ./...
+        run: cargo test
 
       - name: Build
         env:
-          CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --target "${{ matrix.target }}"
+
+      - name: Stage binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          OS: ${{ matrix.os }}
         run: |
           set -euo pipefail
           mkdir -p dist
-
           BIN="md"
-          if [ "${GOOS}" = "windows" ]; then
+          if [ "${OS}" = "windows" ]; then
             BIN="md.exe"
           fi
-
-          go build -trimpath -ldflags="-s -w" -o "dist/${BIN}" ./cmd/md
-
-      - name: Verify static binary (linux only)
-        if: matrix.goos == 'linux'
-        run: |
-          set -euo pipefail
-          file dist/md
-          file dist/md | grep -q "statically linked"
+          cp "target/${TARGET}/release/${BIN}" "dist/${BIN}"
 
       - name: Package
+        shell: bash
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
           ARCHIVE: ${{ matrix.archive }}
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          ARCH="${GOARCH}"
-          if [ "${GOARCH}" = "arm" ] && [ -n "${GOARM}" ]; then
-            ARCH="armv${GOARM}"
-          fi
+          NAME="md_${VERSION}_${OS}_${ARCH}"
 
-          NAME="md_${VERSION}_${GOOS}_${ARCH}"
-
-          if [ "${GOOS}" = "windows" ]; then
+          if [ "${OS}" = "windows" ]; then
             (cd dist && zip -9 "../${NAME}.zip" "md.exe")
             echo "ASSET=${NAME}.zip" >> "$GITHUB_ENV"
           else

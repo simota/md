@@ -1,16 +1,16 @@
 # md
 
-Terminal Markdown viewer written in Go. Single-binary friendly.
+Terminal Markdown viewer written in Rust. Single-binary friendly.
 
 ## Install
 
 ```bash
-go install github.com/simota/md/cmd/md@latest
+cargo install --git https://github.com/simota/md md
 ```
 
 ## Install (binaries from GitHub Releases)
 
-If you don't want to install Go, download a prebuilt binary from GitHub Releases.
+If you don't want to install Rust, download a prebuilt binary from GitHub Releases.
 
 Release assets are named like:
 
@@ -24,7 +24,7 @@ Release assets are named like:
 # Pick a version and platform.
 VERSION=v0.1.0
 GOOS=darwin   # or linux
-ARCH=arm64    # or amd64, armv7
+ARCH=arm64    # or amd64
 
 ASSET="md_${VERSION}_${GOOS}_${ARCH}.tar.gz"
 
@@ -82,7 +82,7 @@ md --pager=auto README.md
 
 ## Notes
 
-- Current dependencies require Go `>= 1.24.2`. The `go.mod` includes a `toolchain` directive so builds can auto-fetch a compatible toolchain.
+- Current dependencies require Rust `>= 1.80`.
 - TUI pager keybinds: `j/k` or arrow keys, `PgUp/PgDn`, `u/d` (half page), `g/G`, `q`/`Esc`, `?` (help), mouse wheel.
 - Extra navigation: `/` (search), `n/N` (next/prev match), `c` (clear search), `t` (TOC).
 - Section navigation: `[` / `]` (prev/next heading).
@@ -105,7 +105,7 @@ git push origin v0.1.0
 ```bash
 make test
 make build
-./md README.md
+./target/release/md README.md
 
 # Optional: create local release artifacts (tar.gz/zip + checksums)
 make dist VERSION=v0.1.0
