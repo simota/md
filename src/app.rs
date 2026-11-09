@@ -114,7 +114,12 @@ pub fn run(opts: Options) -> Result<(), String> {
             };
             out.push_str(&format!("\x1b[1m==> {name} <==\x1b[0m\n"));
         }
-        out.push_str(&body);
+        if out.is_empty() {
+            // Single document: take the body instead of copying it.
+            out = body;
+        } else {
+            out.push_str(&body);
+        }
         printed_any = true;
     }
 

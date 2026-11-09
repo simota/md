@@ -63,7 +63,7 @@ pub struct Rendered {
 impl Rendered {
     /// Full ANSI text with a trailing newline (empty for empty documents).
     pub fn text(&self) -> String {
-        let mut out = String::new();
+        let mut out = String::with_capacity(self.lines.iter().map(|l| l.len() + 1).sum());
         for line in &self.lines {
             out.push_str(line);
             out.push('\n');
@@ -244,7 +244,19 @@ pub fn sanitize_control(input: &str) -> std::borrow::Cow<'_, str> {
     let is_bad = |c: char| {
         (c.is_control() && !matches!(c, '\n' | '\t' | '\r')) || ('\u{80}'..='\u{9f}').contains(&c)
     };
-    if !input.chars().any(is_bad) {
+    // Fast byte scan, same result as `input.chars().any(is_bad)`: C0
+    // controls and DEL are single bytes, and C1 controls (U+0080..=U+009F)
+    // are always encoded as 0xC2 0x80..=0x9F.
+    let bytes = input.as_bytes();
+    let has_bad = bytes.iter().enumerate().any(|(idx, &b)| {
+        (b < 0x20 && !matches!(b, b'\n' | b'\t' | b'\r'))
+            || b == 0x7f
+            || (b == 0xc2
+                && bytes
+                    .get(idx + 1)
+                    .is_some_and(|n| (0x80..=0x9f).contains(n)))
+    });
+    if !has_bad {
         return std::borrow::Cow::Borrowed(input);
     }
     let mut out = String::with_capacity(input.len() + 8);
@@ -757,7 +769,10 @@ impl Out {
             if line.is_empty() && idx != 0 {
                 self.lines.push(blank.to_string());
             } else {
-                self.lines.push(format!("{prefix}{line}"));
+                let mut text = String::with_capacity(prefix.len() + line.len());
+                text.push_str(prefix);
+                text.push_str(&line);
+                self.lines.push(text);
             }
         }
         self.headings
@@ -775,6 +790,7 @@ impl Out {
     }
 
     fn push_wrapped(&mut self, lines: Vec<Vec<Span>>, indent: &str, theme: Theme) {
+        let mut scratch = String::new();
         for line in lines {
             let idx = self.lines.len();
             for span in &line {
@@ -782,8 +798,11 @@ impl Out {
                     self.links.push((id, idx));
                 }
             }
-            self.lines
-                .push(format!("{indent}{}", render_spans_inline(&line, theme)));
+            scratch.clear();
+            scratch.push_str(indent);
+            write_spans_inline(&mut scratch, &line, theme);
+            // Exact-size copy: rendered lines live as long as the document.
+            self.lines.push(scratch.as_str().to_owned());
         }
     }
 }
@@ -806,9 +825,7 @@ fn render_block(out: &mut Out, block: &Block, width: usize, ctx: Ctx) {
         Block::Heading { level, spans } => render_heading(out, *level, spans, width, theme),
         Block::Code { language, text } => {
             let start = out.lines.len();
-            let mut s = String::new();
-            render_code_block(&mut s, language.as_deref(), text, width, theme);
-            out.lines.extend(s.lines().map(str::to_string));
+            render_code_block(&mut out.lines, language.as_deref(), text, width, theme);
             out.code.push(CodeBlockInfo {
                 language: language.clone(),
                 code: text.clone(),
@@ -965,21 +982,24 @@ fn render_heading(out: &mut Out, level: usize, spans: &[Span], width: usize, the
         line: out.lines.len(),
     });
     let mut widest = 0;
+    let mut scratch = String::new();
     for (idx, line) in lines.into_iter().enumerate() {
         widest = widest.max(spans_width(&line));
-        let lead = if idx == 0 {
-            muted(&prefix, theme)
+        scratch.clear();
+        if idx == 0 {
+            scratch.push_str(&muted(&prefix, theme));
         } else {
-            " ".repeat(prefix.len())
-        };
+            scratch.extend(std::iter::repeat(' ').take(prefix.len()));
+        }
         let line_idx = out.lines.len();
         for span in &line {
             if let Some(id) = span.style.link {
                 out.links.push((id, line_idx));
             }
         }
-        out.lines
-            .push(format!("{lead}{}", render_spans_inline(&line, theme)));
+        write_spans_inline(&mut scratch, &line, theme);
+        // Exact-size copy: rendered lines live as long as the document.
+        out.lines.push(scratch.as_str().to_owned());
     }
     if level == 1 {
         out.lines
@@ -1042,11 +1062,11 @@ fn render_list(
     }
 }
 
-fn render_table(
+fn render_table<'a>(
     out: &mut Out,
     aligns: &[Alignment],
-    header: &[Vec<Span>],
-    rows: &[Vec<Vec<Span>>],
+    header: &'a [Vec<Span>],
+    rows: &'a [Vec<Vec<Span>>],
     width: usize,
     theme: Theme,
 ) {
@@ -1056,35 +1076,43 @@ fn render_table(
     if cols == 0 {
         return;
     }
-    let empty: Vec<Span> = Vec::new();
-    let cell = |row: &[Vec<Span>], col: usize| -> Vec<Span> {
-        row.get(col).cloned().unwrap_or_else(|| empty.clone())
+    let cell = |row: &'a [Vec<Span>], col: usize| -> &'a [Span] {
+        row.get(col).map(Vec::as_slice).unwrap_or(&[])
     };
     let header_cells: Vec<Vec<Span>> = (0..cols)
         .map(|c| {
             cell(header, c)
-                .into_iter()
-                .map(|mut s| {
-                    s.style.strong = true;
-                    s
+                .iter()
+                .map(|s| Span {
+                    text: s.text.clone(),
+                    style: InlineStyle {
+                        strong: true,
+                        ..s.style
+                    },
                 })
                 .collect()
         })
         .collect();
-    let body: Vec<Vec<Vec<Span>>> = rows
+    let header_refs: Vec<&[Span]> = header_cells.iter().map(Vec::as_slice).collect();
+    let body: Vec<Vec<&[Span]>> = rows
         .iter()
         .map(|row| (0..cols).map(|c| cell(row, c)).collect())
         .collect();
 
-    // Natural widths (single-line).
+    // Natural layout (only hard breaks) of every cell, header first. It is
+    // reused when rendering a cell whose natural layout fits its column.
+    let natural: Vec<Vec<(Vec<Vec<Span>>, usize)>> = std::iter::once(&header_refs)
+        .chain(body.iter())
+        .map(|row| {
+            row.iter()
+                .map(|spans| wrap_styled_measured(spans, usize::MAX / 4))
+                .collect()
+        })
+        .collect();
     let mut widths = vec![1usize; cols];
-    for row in std::iter::once(&header_cells).chain(body.iter()) {
-        for (c, spans) in row.iter().enumerate() {
-            let natural = wrap_styled(spans, usize::MAX / 4)
-                .iter()
-                .map(|l| spans_width(l))
-                .max()
-                .unwrap_or(0);
+    for row in &natural {
+        for (c, (lines, _)) in row.iter().enumerate() {
+            let natural = lines.iter().map(|l| spans_width(l)).max().unwrap_or(0);
             widths[c] = widths[c].max(natural);
         }
     }
@@ -1113,24 +1141,34 @@ fn render_table(
         muted(&s, theme)
     };
 
-    let render_row = |out: &mut Out, row: &[Vec<Span>]| {
+    let render_row = |out: &mut Out, row: &[&[Span]], natural: Vec<(Vec<Vec<Span>>, usize)>| {
         let wrapped: Vec<Vec<Vec<Span>>> = row
             .iter()
+            .zip(natural)
             .enumerate()
-            .map(|(c, spans)| wrap_styled(spans, widths[c].max(1)))
+            .map(|(c, (spans, (lines, layout_width)))| {
+                let width = widths[c].max(1);
+                if layout_width <= width {
+                    lines
+                } else {
+                    wrap_styled(spans, width)
+                }
+            })
             .collect();
         let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        let mut s = String::new();
         for line_idx in 0..height {
             let out_idx = out.lines.len();
-            let mut s = muted("  |", theme);
+            s.clear();
+            paint(&mut s, muted_code(theme), "  |");
             for (c, cell_lines) in wrapped.iter().enumerate() {
-                let line = cell_lines.get(line_idx).cloned().unwrap_or_default();
-                for span in &line {
+                let line: &[Span] = cell_lines.get(line_idx).map(Vec::as_slice).unwrap_or(&[]);
+                for span in line {
                     if let Some(id) = span.style.link {
                         out.links.push((id, out_idx));
                     }
                 }
-                let used = spans_width(&line);
+                let used = spans_width(line);
                 let pad = widths[c].saturating_sub(used);
                 let (left, right) = match aligns.get(c) {
                     Some(Alignment::Right) => (pad, 0),
@@ -1138,29 +1176,32 @@ fn render_table(
                     _ => (0, pad),
                 };
                 s.push(' ');
-                s.push_str(&" ".repeat(left));
-                s.push_str(&render_spans_inline(&line, theme));
-                s.push_str(&" ".repeat(right));
+                s.extend(std::iter::repeat(' ').take(left));
+                write_spans_inline(&mut s, line, theme);
+                s.extend(std::iter::repeat(' ').take(right));
                 s.push(' ');
-                s.push_str(&muted("|", theme));
+                paint(&mut s, muted_code(theme), "|");
             }
-            out.lines.push(s);
+            // Exact-size copy: rendered lines live as long as the document.
+            out.lines.push(s.as_str().to_owned());
         }
     };
 
+    let mut natural = natural.into_iter();
     out.lines.push(border('-'));
+    let header_natural = natural.next().unwrap_or_default();
     if header.iter().any(|c| !c.is_empty()) {
-        render_row(out, &header_cells);
+        render_row(out, &header_refs, header_natural);
         out.lines.push(border('='));
     }
-    for row in &body {
-        render_row(out, row);
+    for (row, row_natural) in body.iter().zip(natural) {
+        render_row(out, row, row_natural);
     }
     out.lines.push(border('-'));
 }
 
 fn render_code_block(
-    out: &mut String,
+    lines: &mut Vec<String>,
     language: Option<&str>,
     text: &str,
     width: usize,
@@ -1169,43 +1210,71 @@ fn render_code_block(
     let content_width = width.saturating_sub(6).max(12);
     let continuation_width = content_width.saturating_sub(2).max(10);
     let language = language.filter(|value| !value.is_empty());
+    let highlighter = Highlighter::for_language(language);
+    let mut scratch = String::new();
 
-    out.push_str(&code_block_top_border(language, content_width, theme));
-    out.push('\n');
+    lines.push(code_block_top_border(language, content_width, theme));
 
     if text.is_empty() {
-        render_code_row(out, "", content_width, theme, language);
-        out.push('\n');
-        out.push_str(&code_block_bottom_border(content_width, theme));
-        out.push('\n');
+        lines.push(render_code_row(
+            &mut scratch,
+            "",
+            content_width,
+            theme,
+            &highlighter,
+        ));
+        lines.push(code_block_bottom_border(content_width, theme));
         return;
     }
 
     for raw in text.lines() {
-        let raw = raw.replace('\t', "    ");
+        let raw = if raw.contains('\t') {
+            std::borrow::Cow::Owned(raw.replace('\t', "    "))
+        } else {
+            std::borrow::Cow::Borrowed(raw)
+        };
         let wrapped = wrap_code_line(&raw, content_width, continuation_width);
         if wrapped.is_empty() {
-            render_code_row(out, "", content_width, theme, language);
-            out.push('\n');
+            lines.push(render_code_row(
+                &mut scratch,
+                "",
+                content_width,
+                theme,
+                &highlighter,
+            ));
             continue;
         }
 
         for line in wrapped {
-            render_code_row(out, &line, content_width, theme, language);
-            out.push('\n');
+            lines.push(render_code_row(
+                &mut scratch,
+                &line,
+                content_width,
+                theme,
+                &highlighter,
+            ));
         }
     }
 
-    out.push_str(&code_block_bottom_border(content_width, theme));
-    out.push('\n');
+    lines.push(code_block_bottom_border(content_width, theme));
 }
 
 // ---------------------------------------------------------------------------
 // Inline wrapping (whitespace + CJK aware)
 // ---------------------------------------------------------------------------
 
+/// A run of word text with a single style: `text[start..end]` of the
+/// owning [`Tokens`] buffer. An empty range is a zero-width link marker.
+#[derive(Clone, Copy)]
+struct Piece {
+    style: InlineStyle,
+    start: usize,
+    end: usize,
+}
+
+/// An unbreakable unit: `pieces[pieces.start..pieces.end]` of [`Tokens`].
 struct Word {
-    spans: Vec<Span>,
+    pieces: std::ops::Range<usize>,
     space_before: bool,
     width: usize,
 }
@@ -1213,6 +1282,104 @@ struct Word {
 enum Token {
     Word(Word),
     Break,
+}
+
+/// Tokenized inline content. Word text lives in one shared buffer so that
+/// tokenizing does not allocate per word (or per CJK character).
+#[derive(Default)]
+struct Tokens {
+    tokens: Vec<Token>,
+    pieces: Vec<Piece>,
+    text: String,
+}
+
+impl Tokens {
+    fn new_word(&mut self, space_before: bool) {
+        let at = self.pieces.len();
+        self.tokens.push(Token::Word(Word {
+            pieces: at..at,
+            space_before,
+            width: 0,
+        }));
+    }
+
+    fn has_last_word(&self) -> bool {
+        matches!(self.tokens.last(), Some(Token::Word(_)))
+    }
+
+    /// Append a zero-width marker piece to the last word (never merged).
+    fn push_marker(&mut self, style: InlineStyle) {
+        let Some(Token::Word(word)) = self.tokens.last_mut() else {
+            return;
+        };
+        let at = self.text.len();
+        self.pieces.push(Piece {
+            style,
+            start: at,
+            end: at,
+        });
+        word.pieces.end = self.pieces.len();
+    }
+
+    /// Append text to the last word, merging into its last piece when the
+    /// style matches (including into a marker piece).
+    fn push_text(&mut self, text: &str, style: InlineStyle) {
+        let Some(Token::Word(word)) = self.tokens.last_mut() else {
+            return;
+        };
+        word.width += UnicodeWidthStr::width(text);
+        let start = self.text.len();
+        self.text.push_str(text);
+        let end = self.text.len();
+        if word.pieces.end > word.pieces.start {
+            // The word's last piece is also the last piece overall, and its
+            // text ends at the end of the buffer, so extending it is exact.
+            let last = &mut self.pieces[word.pieces.end - 1];
+            if last.style == style {
+                last.end = end;
+                return;
+            }
+        }
+        self.pieces.push(Piece { style, start, end });
+        word.pieces.end = self.pieces.len();
+    }
+
+    /// Append one character whose `char_width` is `width`. Equivalent to
+    /// `push_text` with the one-character string, without the string scan.
+    fn push_char(&mut self, ch: char, width: usize, style: InlineStyle) {
+        let mut buf = [0u8; 4];
+        let text = ch.encode_utf8(&mut buf);
+        let Some(Token::Word(word)) = self.tokens.last_mut() else {
+            return;
+        };
+        word.width += single_char_str_width(ch, width);
+        let start = self.text.len();
+        self.text.push_str(text);
+        let end = self.text.len();
+        if word.pieces.end > word.pieces.start {
+            let last = &mut self.pieces[word.pieces.end - 1];
+            if last.style == style {
+                last.end = end;
+                return;
+            }
+        }
+        self.pieces.push(Piece { style, start, end });
+        word.pieces.end = self.pieces.len();
+    }
+
+    /// Does the last word end with a character that must not end a line?
+    fn last_is_no_end(&self) -> bool {
+        match self.tokens.last() {
+            Some(Token::Word(w)) if w.pieces.end > w.pieces.start => {
+                let piece = self.pieces[w.pieces.end - 1];
+                self.text[piece.start..piece.end]
+                    .chars()
+                    .last()
+                    .is_some_and(is_no_line_end)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Characters that must not start a line (kinsoku shori + ASCII closers).
@@ -1280,68 +1447,58 @@ fn char_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
-fn push_into_word(word: &mut Word, text: &str, style: InlineStyle) {
-    word.width += UnicodeWidthStr::width(text);
-    if let Some(last) = word.spans.last_mut() {
-        if last.style == style {
-            last.text.push_str(text);
-            return;
-        }
+/// `UnicodeWidthStr::width` of the one-character string `ch`, given
+/// `char_width(ch)`: the two only differ for control characters, which are
+/// one column wide in string context (checked exhaustively in tests).
+fn single_char_str_width(ch: char, char_width: usize) -> usize {
+    if ch.is_control() {
+        1
+    } else {
+        char_width
     }
-    word.spans.push(Span {
-        text: text.to_string(),
-        style,
-    });
 }
 
-fn tokenize(spans: &[Span]) -> Vec<Token> {
-    let mut tokens: Vec<Token> = Vec::new();
+fn tokenize(spans: &[Span]) -> Tokens {
+    // Word text never exceeds the input; words and pieces are at most one
+    // per character, typically far fewer.
+    let len: usize = spans.iter().map(|span| span.text.len()).sum();
+    let mut t = Tokens {
+        tokens: Vec::with_capacity(len / 4 + 1),
+        pieces: Vec::with_capacity(len / 4 + 1),
+        text: String::with_capacity(len),
+    };
     let mut pending_space = false;
     let mut open = false; // may the next char be glued to the last word?
-
-    fn new_word(tokens: &mut Vec<Token>, space_before: bool) {
-        tokens.push(Token::Word(Word {
-            spans: Vec::new(),
-            space_before,
-            width: 0,
-        }));
-    }
-    fn last_word(tokens: &mut [Token]) -> Option<&mut Word> {
-        match tokens.last_mut() {
-            Some(Token::Word(w)) => Some(w),
-            _ => None,
-        }
-    }
 
     for span in spans {
         if span.text.is_empty() {
             // Zero-width marker (used to record link positions).
             if span.style.link.is_some() {
-                if !(open && !pending_space) || last_word(&mut tokens).is_none() {
-                    new_word(&mut tokens, pending_space);
+                if !(open && !pending_space) || !t.has_last_word() {
+                    t.new_word(pending_space);
                     pending_space = false;
                     open = true;
                 }
-                if let Some(word) = last_word(&mut tokens) {
-                    word.spans.push(span.clone());
-                }
+                t.push_marker(span.style);
             }
             continue;
         }
         if span.style.code {
-            if !(open && !pending_space) || last_word(&mut tokens).is_none() {
-                new_word(&mut tokens, pending_space);
+            if !(open && !pending_space) || !t.has_last_word() {
+                t.new_word(pending_space);
             }
             pending_space = false;
-            if let Some(word) = last_word(&mut tokens) {
-                push_into_word(word, &span.text.replace('\n', " "), span.style);
+            if span.text.contains('\n') {
+                t.push_text(&span.text.replace('\n', " "), span.style);
+            } else {
+                t.push_text(&span.text, span.style);
             }
             open = true;
             continue;
         }
         for ch in span.text.chars() {
             if ch == '\n' {
-                tokens.push(Token::Break);
+                t.tokens.push(Token::Break);
                 pending_space = false;
                 open = false;
                 continue;
@@ -1351,55 +1508,61 @@ fn tokenize(spans: &[Span]) -> Vec<Token> {
                 open = false;
                 continue;
             }
-            let wide = char_width(ch) >= 2;
-            let has_word = matches!(tokens.last(), Some(Token::Word(_)));
-            let attach = has_word
+            let ch_width = char_width(ch);
+            let wide = ch_width >= 2;
+            let attach = t.has_last_word()
                 && !pending_space
-                && (is_no_line_start(ch)
-                    || (open && !wide)
-                    || (open && wide && last_is_no_end(&tokens)));
+                && ((open && !wide)
+                    || is_no_line_start(ch)
+                    || (open && wide && t.last_is_no_end()));
             if !attach {
-                new_word(&mut tokens, pending_space);
+                t.new_word(pending_space);
             }
             pending_space = false;
-            if let Some(word) = last_word(&mut tokens) {
-                let mut buf = [0u8; 4];
-                push_into_word(word, ch.encode_utf8(&mut buf), span.style);
-            }
+            t.push_char(ch, ch_width, span.style);
             open = !wide || is_no_line_end(ch);
         }
     }
-    tokens
+    t
 }
 
-fn last_is_no_end(tokens: &[Token]) -> bool {
-    match tokens.last() {
-        Some(Token::Word(w)) => w
-            .spans
-            .last()
-            .and_then(|s| s.text.chars().last())
-            .is_some_and(is_no_line_end),
-        _ => false,
+/// Append styled text to a line, merging with the last span when the style
+/// matches (empty text still creates a span, which records link positions).
+fn push_line_text(line: &mut Vec<Span>, text: &str, style: InlineStyle) {
+    if let Some(last) = line.last_mut() {
+        if last.style == style {
+            last.text.push_str(text);
+            return;
+        }
     }
+    line.push(Span {
+        text: text.to_string(),
+        style,
+    });
 }
 
 fn wrap_styled(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
+    wrap_styled_impl::<false>(spans, width).0
+}
+
+/// `wrap_styled` plus the largest line width used for the wrapping
+/// decisions. Wrapping the same spans at any width >= that value gives the
+/// same lines (no decision can change).
+fn wrap_styled_measured(spans: &[Span], width: usize) -> (Vec<Vec<Span>>, usize) {
+    wrap_styled_impl::<true>(spans, width)
+}
+
+/// Shared implementation; the measurement is compiled out when `MEASURE`
+/// is false (the hot path for paragraphs).
+fn wrap_styled_impl<const MEASURE: bool>(spans: &[Span], width: usize) -> (Vec<Vec<Span>>, usize) {
     let width = width.max(1);
     let mut lines: Vec<Vec<Span>> = Vec::new();
     let mut current: Vec<Span> = Vec::new();
     let mut current_width = 0usize;
+    let mut layout_width = 0usize;
 
-    fn push_span(line: &mut Vec<Span>, span: Span) {
-        if let Some(last) = line.last_mut() {
-            if last.style == span.style {
-                last.text.push_str(&span.text);
-                return;
-            }
-        }
-        line.push(span);
-    }
-
-    for token in tokenize(spans) {
+    let t = tokenize(spans);
+    for token in &t.tokens {
         let word = match token {
             Token::Break => {
                 lines.push(std::mem::take(&mut current));
@@ -1408,6 +1571,7 @@ fn wrap_styled(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
             }
             Token::Word(word) => word,
         };
+        let pieces = &t.pieces[word.pieces.clone()];
         let mut sep = usize::from(word.space_before && current_width > 0);
         if current_width > 0 && current_width + sep + word.width > width {
             lines.push(std::mem::take(&mut current));
@@ -1416,47 +1580,45 @@ fn wrap_styled(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
         }
         if sep == 1 {
             let prev = current.last().map(|s| s.style);
-            let next = word.spans.first().map(|s| s.style);
+            let next = pieces.first().map(|p| p.style);
             let style = match (prev, next) {
                 (Some(a), Some(b)) if a == b => a,
                 _ => InlineStyle::default(),
             };
-            push_span(
-                &mut current,
-                Span {
-                    text: " ".to_string(),
-                    style,
-                },
-            );
+            push_line_text(&mut current, " ", style);
             current_width += 1;
+            if MEASURE {
+                layout_width = layout_width.max(current_width);
+            }
         }
         if word.width <= width.saturating_sub(current_width) {
             current_width += word.width;
-            for span in word.spans {
-                push_span(&mut current, span);
+            if MEASURE {
+                layout_width = layout_width.max(current_width);
+            }
+            for piece in pieces {
+                push_line_text(&mut current, &t.text[piece.start..piece.end], piece.style);
             }
             continue;
         }
         // Word longer than a line: break it by character.
-        for span in word.spans {
-            if span.text.is_empty() {
-                push_span(&mut current, span);
+        for piece in pieces {
+            let text = &t.text[piece.start..piece.end];
+            if text.is_empty() {
+                push_line_text(&mut current, text, piece.style);
                 continue;
             }
-            for ch in span.text.chars() {
+            for (idx, ch) in text.char_indices() {
                 let w = char_width(ch);
                 if current_width > 0 && current_width + w > width {
                     lines.push(std::mem::take(&mut current));
                     current_width = 0;
                 }
-                push_span(
-                    &mut current,
-                    Span {
-                        text: ch.to_string(),
-                        style: span.style,
-                    },
-                );
+                push_line_text(&mut current, &text[idx..idx + ch.len_utf8()], piece.style);
                 current_width += w;
+                if MEASURE {
+                    layout_width = layout_width.max(current_width);
+                }
             }
         }
     }
@@ -1469,7 +1631,7 @@ fn wrap_styled(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
     if lines.is_empty() {
         lines.push(Vec::new());
     }
-    lines
+    (lines, layout_width)
 }
 
 fn spans_width(spans: &[Span]) -> usize {
@@ -1496,32 +1658,25 @@ fn trim_spans(spans: Vec<Span>) -> Vec<Span> {
     out
 }
 
-fn render_spans_inline(spans: &[Span], theme: Theme) -> String {
-    let mut out = String::new();
+fn write_spans_inline(out: &mut String, spans: &[Span], theme: Theme) {
     for span in spans {
-        out.push_str(&render_span(span, theme));
+        write_span(out, span, theme);
     }
-    out
 }
 
-fn render_span(span: &Span, theme: Theme) -> String {
+/// Append `span` as ANSI text: the color in its own SGR sequence (easy to
+/// match in tests), then the attributes, the text and a reset.
+fn write_span(out: &mut String, span: &Span, theme: Theme) {
     if span.text.is_empty() {
-        return String::new();
+        return;
     }
     let style = span.style;
-    let mut codes: Vec<&str> = Vec::new();
-    if style.strong {
-        codes.push("1");
-    }
-    if style.emphasis {
-        codes.push("3");
-    }
-    if style.link.is_some() && !style.muted && !style.code {
-        codes.push("4");
-    }
-    if style.strike {
-        codes.push("9");
-    }
+    let attrs = [
+        (style.strong, "1"),
+        (style.emphasis, "3"),
+        (style.link.is_some() && !style.muted && !style.code, "4"),
+        (style.strike, "9"),
+    ];
     let color = if style.code {
         Some(match theme {
             Theme::Dark => "38;2;255;160;160",
@@ -1534,28 +1689,30 @@ fn render_span(span: &Span, theme: Theme) -> String {
     } else {
         None
     };
+    let any_attr = attrs.iter().any(|(on, _)| *on);
+    if color.is_none() && !any_attr {
+        out.push_str(&span.text);
+        return;
+    }
     if let Some(color) = color {
-        codes.push(color);
+        out.push_str("\x1b[");
+        out.push_str(color);
+        out.push('m');
     }
-    if codes.is_empty() {
-        return span.text.clone();
-    }
-    // Keep the color in its own SGR sequence so it is easy to match in tests.
-    let attrs: Vec<&str> = codes
-        .iter()
-        .copied()
-        .filter(|c| !c.starts_with("38;"))
-        .collect();
-    let mut out = String::new();
-    if let Some(color) = color {
-        out.push_str(&format!("\x1b[{color}m"));
-    }
-    if !attrs.is_empty() {
-        out.push_str(&format!("\x1b[{}m", attrs.join(";")));
+    if any_attr {
+        out.push_str("\x1b[");
+        let mut first = true;
+        for (_, code) in attrs.iter().filter(|(on, _)| *on) {
+            if !first {
+                out.push(';');
+            }
+            out.push_str(code);
+            first = false;
+        }
+        out.push('m');
     }
     out.push_str(&span.text);
     out.push_str("\x1b[0m");
-    out
 }
 
 pub fn strip_ansi(input: &str) -> String {
@@ -1601,6 +1758,10 @@ fn spans_plain_text(spans: &[Span]) -> String {
 
 /// Display width of a string, ignoring ANSI escape sequences.
 pub fn visible_width(input: &str) -> usize {
+    if !input.contains('\x1b') {
+        // `strip_ansi` only changes text at ESC characters.
+        return UnicodeWidthStr::width(input);
+    }
     UnicodeWidthStr::width(strip_ansi(input).as_str())
 }
 
@@ -1723,60 +1884,79 @@ fn muted(text: &str, theme: Theme) -> String {
     format!("\x1b[{}m{text}\x1b[0m", muted_code(theme))
 }
 
-fn command_color(text: &str, theme: Theme) -> String {
-    let color = match theme {
-        Theme::Dark => "\x1b[38;2;255;107;107m",
-        Theme::Light => "\x1b[38;2;190;24;24m",
-    };
-    format!("{color}\x1b[1m{text}\x1b[0m")
+/// Append `\x1b[{sgr}m{text}\x1b[0m`.
+fn paint(out: &mut String, sgr: &str, text: &str) {
+    out.push_str("\x1b[");
+    out.push_str(sgr);
+    out.push('m');
+    out.push_str(text);
+    out.push_str("\x1b[0m");
 }
 
-fn keyword_color(text: &str, theme: Theme) -> String {
+fn push_command(out: &mut String, text: &str, theme: Theme) {
     let color = match theme {
-        Theme::Dark => "\x1b[38;2;255;107;107m",
-        Theme::Light => "\x1b[38;2;190;24;24m",
+        Theme::Dark => "38;2;255;107;107",
+        Theme::Light => "38;2;190;24;24",
     };
-    format!("{color}{text}\x1b[0m")
+    out.push_str("\x1b[");
+    out.push_str(color);
+    out.push_str("m\x1b[1m");
+    out.push_str(text);
+    out.push_str("\x1b[0m");
 }
 
-fn flag_color(text: &str, theme: Theme) -> String {
+fn push_keyword(out: &mut String, text: &str, theme: Theme) {
     let color = match theme {
-        Theme::Dark => "\x1b[38;2;255;209;102m",
-        Theme::Light => "\x1b[38;2;146;64;14m",
+        Theme::Dark => "38;2;255;107;107",
+        Theme::Light => "38;2;190;24;24",
     };
-    format!("{color}{text}\x1b[0m")
+    paint(out, color, text);
 }
 
-fn shell_text_color(text: &str, theme: Theme) -> String {
+fn push_flag(out: &mut String, text: &str, theme: Theme) {
     let color = match theme {
-        Theme::Dark => "\x1b[38;2;255;160;160m",
-        Theme::Light => "\x1b[38;2;153;27;27m",
+        Theme::Dark => "38;2;255;209;102",
+        Theme::Light => "38;2;146;64;14",
     };
-    format!("{color}{text}\x1b[0m")
+    paint(out, color, text);
+}
+
+fn push_shell_text(out: &mut String, text: &str, theme: Theme) {
+    let color = match theme {
+        Theme::Dark => "38;2;255;160;160",
+        Theme::Light => "38;2;153;27;27",
+    };
+    paint(out, color, text);
+}
+
+fn push_string(out: &mut String, text: &str, theme: Theme) {
+    let color = match theme {
+        Theme::Dark => "38;2;126;231;135",
+        Theme::Light => "38;2;21;128;61",
+    };
+    paint(out, color, text);
 }
 
 fn string_color(text: &str, theme: Theme) -> String {
-    let color = match theme {
-        Theme::Dark => "\x1b[38;2;126;231;135m",
-        Theme::Light => "\x1b[38;2;21;128;61m",
-    };
-    format!("{color}{text}\x1b[0m")
+    let mut out = String::new();
+    push_string(&mut out, text, theme);
+    out
 }
 
-fn comment_color(text: &str, theme: Theme) -> String {
+fn push_comment(out: &mut String, text: &str, theme: Theme) {
     let color = match theme {
-        Theme::Dark => "\x1b[38;2;128;139;150m",
-        Theme::Light => "\x1b[38;2;106;115;125m",
+        Theme::Dark => "38;2;128;139;150",
+        Theme::Light => "38;2;106;115;125",
     };
-    format!("{color}{text}\x1b[0m")
+    paint(out, color, text);
 }
 
-fn code_block_text(text: &str, theme: Theme) -> String {
+fn push_code_text(out: &mut String, text: &str, theme: Theme) {
     let color = match theme {
-        Theme::Dark => "\x1b[38;2;230;230;230m",
-        Theme::Light => "\x1b[38;2;26;26;26m",
+        Theme::Dark => "38;2;230;230;230",
+        Theme::Light => "38;2;26;26;26",
     };
-    format!("{color}{text}\x1b[0m")
+    paint(out, color, text);
 }
 
 fn code_block_top_border(language: Option<&str>, content_width: usize, theme: Theme) -> String {
@@ -1793,24 +1973,29 @@ fn code_block_bottom_border(content_width: usize, theme: Theme) -> String {
     muted(&format!("  +{}+", "-".repeat(content_width + 2)), theme)
 }
 
+/// Render one code row into the reusable `scratch` buffer and return an
+/// exact-size copy (rendered lines are kept for the document's lifetime, so
+/// they should not carry spare capacity).
 fn render_code_row(
-    out: &mut String,
+    scratch: &mut String,
     text: &str,
     content_width: usize,
     theme: Theme,
-    language: Option<&str>,
-) {
+    highlighter: &Highlighter,
+) -> String {
     let text = fit_code_cell(text, content_width);
-    let padding = " ".repeat(content_width.saturating_sub(visible_width(&text)));
-    out.push_str(&muted("  | ", theme));
-    out.push_str(&highlight_code_line(&text, language, theme));
-    out.push_str(&padding);
-    out.push_str(&muted(" |", theme));
+    let padding = content_width.saturating_sub(visible_width(&text));
+    scratch.clear();
+    paint(scratch, muted_code(theme), "  | ");
+    highlighter.write_line(scratch, &text, theme);
+    scratch.extend(std::iter::repeat(' ').take(padding));
+    paint(scratch, muted_code(theme), " |");
+    scratch.as_str().to_owned()
 }
 
-fn fit_code_cell(text: &str, width: usize) -> String {
+fn fit_code_cell(text: &str, width: usize) -> std::borrow::Cow<'_, str> {
     if visible_width(text) <= width {
-        return text.to_string();
+        return std::borrow::Cow::Borrowed(text);
     }
     let mut out = String::new();
     let mut used = 0;
@@ -1822,7 +2007,7 @@ fn fit_code_cell(text: &str, width: usize) -> String {
         used += ch_width;
         out.push(ch);
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2041,59 +2226,79 @@ fn lang_spec(lang: &str) -> Option<LangSpec> {
     Some(spec)
 }
 
-fn highlight_code_line(text: &str, language: Option<&str>, theme: Theme) -> String {
-    let lang = language.unwrap_or_default().to_ascii_lowercase();
-    if matches!(
-        lang.as_str(),
-        "bash" | "sh" | "shell" | "zsh" | "console" | "fish" | "powershell" | "ps1"
-    ) {
-        return highlight_shell_line(text, theme);
-    }
-    if lang.is_empty() && looks_like_shell_line(text) {
-        return highlight_shell_line(text, theme);
-    }
-    if matches!(lang.as_str(), "diff" | "patch") {
-        return highlight_diff_line(text, theme);
-    }
-    if let Some(spec) = lang_spec(&lang) {
-        return highlight_generic_line(text, &spec, theme);
-    }
-    code_block_text(text, theme)
+/// Syntax highlighter for one code block (chosen once per block).
+enum Highlighter {
+    Shell,
+    /// No language given: lines that look like shell commands are
+    /// highlighted as shell, the rest as plain code.
+    Auto,
+    Diff,
+    Generic(LangSpec),
+    Plain,
 }
 
-fn highlight_diff_line(text: &str, theme: Theme) -> String {
+impl Highlighter {
+    fn for_language(language: Option<&str>) -> Self {
+        let lang = language.unwrap_or_default().to_ascii_lowercase();
+        if matches!(
+            lang.as_str(),
+            "bash" | "sh" | "shell" | "zsh" | "console" | "fish" | "powershell" | "ps1"
+        ) {
+            return Highlighter::Shell;
+        }
+        if lang.is_empty() {
+            return Highlighter::Auto;
+        }
+        if matches!(lang.as_str(), "diff" | "patch") {
+            return Highlighter::Diff;
+        }
+        match lang_spec(&lang) {
+            Some(spec) => Highlighter::Generic(spec),
+            None => Highlighter::Plain,
+        }
+    }
+
+    fn write_line(&self, out: &mut String, text: &str, theme: Theme) {
+        match self {
+            Highlighter::Shell => highlight_shell_line(out, text, theme),
+            Highlighter::Auto if looks_like_shell_line(text) => {
+                highlight_shell_line(out, text, theme)
+            }
+            Highlighter::Diff => highlight_diff_line(out, text, theme),
+            Highlighter::Generic(spec) => highlight_generic_line(out, text, spec, theme),
+            Highlighter::Auto | Highlighter::Plain => push_code_text(out, text, theme),
+        }
+    }
+}
+
+fn highlight_diff_line(out: &mut String, text: &str, theme: Theme) {
     if text.starts_with("+++") || text.starts_with("---") {
-        bold(text)
+        paint(out, "1", text);
     } else if text.starts_with('+') {
-        string_color(text, theme)
+        push_string(out, text, theme);
     } else if text.starts_with('-') {
-        keyword_color(text, theme)
+        push_keyword(out, text, theme);
     } else if text.starts_with("@@") {
-        accent(text, theme)
+        paint(out, accent_code(theme), text);
     } else {
-        code_block_text(text, theme)
+        push_code_text(out, text, theme);
     }
 }
 
-fn bold(text: &str) -> String {
-    format!("\x1b[1m{text}\x1b[0m")
-}
-
-fn highlight_generic_line(text: &str, spec: &LangSpec, theme: Theme) -> String {
-    let mut out = String::new();
-    let chars: Vec<char> = text.chars().collect();
+fn highlight_generic_line(out: &mut String, text: &str, spec: &LangSpec, theme: Theme) {
+    // Byte offsets into `text`; unhighlighted text is always the contiguous
+    // run `text[plain..i]`.
     let mut i = 0;
-    let mut plain = String::new();
+    let mut plain = 0;
 
-    let flush_plain = |out: &mut String, plain: &mut String| {
-        if !plain.is_empty() {
-            out.push_str(&code_block_text(plain, theme));
-            plain.clear();
+    let flush_plain = |out: &mut String, plain: usize, i: usize| {
+        if plain < i {
+            push_code_text(out, &text[plain..i], theme);
         }
     };
 
-    while i < chars.len() {
-        let rest: String = chars[i..].iter().collect();
+    while let Some(ch) = text[i..].chars().next() {
+        let rest = &text[i..];
         if spec
             .line_comment
             .iter()
@@ -2101,95 +2306,92 @@ fn highlight_generic_line(text: &str, spec: &LangSpec, theme: Theme) -> String {
             || rest.starts_with("/*")
         {
             // `#` only starts a comment at a token boundary (e.g. not `a#b`).
-            let boundary = i == 0 || !chars[i - 1].is_alphanumeric();
+            let boundary = text[..i]
+                .chars()
+                .next_back()
+                .map_or(true, |prev| !prev.is_alphanumeric());
             if boundary {
-                flush_plain(&mut out, &mut plain);
-                out.push_str(&comment_color(&rest, theme));
-                return out;
+                flush_plain(out, plain, i);
+                push_comment(out, rest, theme);
+                return;
             }
         }
-        let ch = chars[i];
         if ch == '"' || ch == '\'' || ch == '`' {
             // Rust lifetimes / char-like apostrophes: only treat as a string
             // when the quote is closed on this line.
-            let close = chars[i + 1..]
-                .iter()
-                .enumerate()
-                .scan(false, |escaped, (idx, c)| {
-                    let hit = !*escaped && *c == ch;
-                    *escaped = !*escaped && *c == '\\';
-                    Some((idx, hit))
-                })
-                .find(|(_, hit)| *hit)
-                .map(|(idx, _)| i + 1 + idx);
+            let body = i + ch.len_utf8();
+            let mut escaped = false;
+            let close = text[body..].char_indices().find_map(|(off, c)| {
+                let hit = !escaped && c == ch;
+                escaped = !escaped && c == '\\';
+                hit.then_some(body + off)
+            });
             if let Some(end) = close {
-                flush_plain(&mut out, &mut plain);
-                let s: String = chars[i..=end].iter().collect();
-                out.push_str(&string_color(&s, theme));
-                i = end + 1;
+                flush_plain(out, plain, i);
+                let end = end + ch.len_utf8();
+                push_string(out, &text[i..end], theme);
+                i = end;
+                plain = i;
                 continue;
             }
         }
-        if ch.is_alphanumeric() || ch == '_' || ch == '#' {
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '#';
+        if is_word_char(ch) {
             let start = i;
-            while i < chars.len()
-                && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '#')
-            {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            if spec.keywords.contains(&word.as_str()) {
-                flush_plain(&mut out, &mut plain);
-                out.push_str(&keyword_color(&word, theme));
-            } else if word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                flush_plain(&mut out, &mut plain);
-                out.push_str(&flag_color(&word, theme));
-            } else {
-                plain.push_str(&word);
+            i = text[start..]
+                .char_indices()
+                .find(|(_, c)| !is_word_char(*c))
+                .map_or(text.len(), |(off, _)| start + off);
+            let word = &text[start..i];
+            if spec.keywords.contains(&word) {
+                flush_plain(out, plain, start);
+                push_keyword(out, word, theme);
+                plain = i;
+            } else if word.starts_with(|c: char| c.is_ascii_digit()) {
+                flush_plain(out, plain, start);
+                push_flag(out, word, theme);
+                plain = i;
             }
             continue;
         }
-        plain.push(ch);
-        i += 1;
+        i += ch.len_utf8();
     }
-    flush_plain(&mut out, &mut plain);
-    out
+    flush_plain(out, plain, i);
 }
 
-fn highlight_shell_line(text: &str, theme: Theme) -> String {
+fn highlight_shell_line(out: &mut String, text: &str, theme: Theme) {
     let trimmed = text.trim_start();
     if trimmed.starts_with('#') {
-        return comment_color(text, theme);
+        push_comment(out, text, theme);
+        return;
     }
 
-    let mut out = String::new();
     let mut token_start = !text.starts_with("  ");
     for token in shell_tokens_preserving_space(text) {
         if token.trim().is_empty() {
-            out.push_str(&token);
+            out.push_str(token);
             continue;
         }
         if token_start {
             if token == "$" || token == ">" {
-                out.push_str(&comment_color(&token, theme));
+                push_comment(out, token, theme);
                 continue;
             }
-            out.push_str(&command_color(&token, theme));
+            push_command(out, token, theme);
             token_start = false;
-        } else if matches!(token.as_str(), "|" | "&&" | "||" | ";") {
-            out.push_str(&comment_color(&token, theme));
+        } else if matches!(token, "|" | "&&" | "||" | ";") {
+            push_comment(out, token, theme);
             token_start = true;
         } else if token.starts_with('-') {
-            out.push_str(&flag_color(&token, theme));
+            push_flag(out, token, theme);
         } else if token.starts_with('"') || token.starts_with('\'') {
-            out.push_str(&string_color(&token, theme));
+            push_string(out, token, theme);
         } else if token.contains("://") {
-            out.push_str(&accent(&token, theme));
+            paint(out, accent_code(theme), token);
         } else {
-            out.push_str(&shell_text_color(&token, theme));
+            push_shell_text(out, token, theme);
         }
     }
-    out
 }
 
 fn looks_like_shell_line(text: &str) -> bool {
@@ -2233,31 +2435,20 @@ fn looks_like_shell_line(text: &str) -> bool {
         || command.starts_with("./")
 }
 
-fn shell_tokens_preserving_space(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut current_is_space = None;
-
-    for ch in text.chars() {
-        let is_space = ch.is_whitespace();
-        match current_is_space {
-            Some(kind) if kind == is_space => current.push(ch),
-            Some(_) => {
-                tokens.push(current);
-                current = ch.to_string();
-                current_is_space = Some(is_space);
-            }
-            None => {
-                current.push(ch);
-                current_is_space = Some(is_space);
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+/// Split `text` into maximal runs of whitespace / non-whitespace.
+fn shell_tokens_preserving_space(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let first = rest.chars().next()?;
+        let is_space = first.is_whitespace();
+        let end = rest
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() != is_space)
+            .map_or(rest.len(), |(idx, _)| idx);
+        let (token, tail) = rest.split_at(end);
+        rest = tail;
+        Some(token)
+    })
 }
 
 #[cfg(test)]
@@ -2614,6 +2805,31 @@ mod tests {
         assert!(p.contains("evil ^[]52;c;Zm9v^G text"));
         assert!(p.contains("^[[2Jcode"));
         assert_eq!(sanitize_control("a\tb\u{9b}"), "a\tb<U+009B>");
+    }
+
+    #[test]
+    fn sanitize_fast_path_matches_char_predicate_for_every_char() {
+        for ch in (0..=0x10FFFFu32).filter_map(char::from_u32) {
+            let bad = (ch.is_control() && !matches!(ch, '\n' | '\t' | '\r'))
+                || ('\u{80}'..='\u{9f}').contains(&ch);
+            let text = format!("a{ch}b");
+            let borrowed = matches!(sanitize_control(&text), std::borrow::Cow::Borrowed(_));
+            assert_eq!(borrowed, !bad, "U+{:04X}", ch as u32);
+        }
+    }
+
+    #[test]
+    fn single_char_width_matches_str_width_for_every_char() {
+        for ch in (0..=0x10FFFFu32).filter_map(char::from_u32) {
+            let mut buf = [0u8; 4];
+            let text = ch.encode_utf8(&mut buf);
+            assert_eq!(
+                single_char_str_width(ch, char_width(ch)),
+                UnicodeWidthStr::width(&*text),
+                "U+{:04X}",
+                ch as u32
+            );
+        }
     }
 
     #[test]

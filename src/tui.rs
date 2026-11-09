@@ -949,23 +949,27 @@ impl Model {
 
     fn draw(&self, stdout: &mut io::Stdout) -> Result<(), String> {
         let res: io::Result<()> = (|| {
+            // Compose the whole frame first and write it at once: one write
+            // instead of many small ones through stdout's line buffer.
+            let mut frame: Vec<u8> = Vec::with_capacity(self.width * self.height * 4);
             match self.overlay {
                 Overlay::Help => {
-                    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-                    self.draw_help(stdout)?;
+                    queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
+                    self.draw_help(&mut frame)?;
                 }
                 Overlay::Toc | Overlay::Links | Overlay::Files => {
-                    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
-                    self.draw_picker(stdout)?;
+                    queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
+                    self.draw_picker(&mut frame)?;
                 }
-                Overlay::None => self.draw_main(stdout)?,
+                Overlay::None => self.draw_main(&mut frame)?,
             }
+            stdout.write_all(&frame)?;
             stdout.flush()
         })();
         res.map_err(|err| format!("draw: {err}"))
     }
 
-    fn draw_main(&self, stdout: &mut io::Stdout) -> io::Result<()> {
+    fn draw_main(&self, stdout: &mut Vec<u8>) -> io::Result<()> {
         self.draw_bar(stdout, 0, &self.header_text(), true)?;
         let content_height = self.page_size();
         let start = min(self.offset, self.display.len());
@@ -1026,7 +1030,7 @@ impl Model {
         )
     }
 
-    fn draw_help(&self, stdout: &mut io::Stdout) -> io::Result<()> {
+    fn draw_help(&self, stdout: &mut Vec<u8>) -> io::Result<()> {
         let lines = [
             "Keys",
             "",
@@ -1064,7 +1068,7 @@ impl Model {
         Ok(())
     }
 
-    fn draw_picker(&self, stdout: &mut io::Stdout) -> io::Result<()> {
+    fn draw_picker(&self, stdout: &mut Vec<u8>) -> io::Result<()> {
         let kind = self.overlay;
         let all_count = match kind {
             Overlay::Toc => self.rendered.headings.len(),
@@ -1104,7 +1108,7 @@ impl Model {
 
         let mut row = top;
         let mut put =
-            |stdout: &mut io::Stdout, text: &str, selected: bool, dim: bool| -> io::Result<()> {
+            |stdout: &mut Vec<u8>, text: &str, selected: bool, dim: bool| -> io::Result<()> {
                 if row >= self.height {
                     return Ok(());
                 }
@@ -1176,13 +1180,7 @@ impl Model {
         Ok(())
     }
 
-    fn draw_bar(
-        &self,
-        stdout: &mut io::Stdout,
-        row: u16,
-        text: &str,
-        header: bool,
-    ) -> io::Result<()> {
+    fn draw_bar(&self, stdout: &mut Vec<u8>, row: u16, text: &str, header: bool) -> io::Result<()> {
         let bg = if header {
             Color::DarkBlue
         } else {
@@ -1786,6 +1784,8 @@ pub fn osc52_sequence(text: &str, tmux: bool) -> String {
 
 struct SearchMatcher {
     needle: Vec<char>,
+    /// `needle` as a string (for substring search without allocation).
+    needle_str: String,
     sensitive: bool,
 }
 
@@ -1793,11 +1793,16 @@ impl SearchMatcher {
     fn new(query: &str) -> Self {
         // Smart case: any uppercase letter makes the search case-sensitive.
         let sensitive = query.chars().any(char::is_uppercase);
-        let needle = query
+        let needle: Vec<char> = query
             .chars()
             .map(|c| if sensitive { c } else { fold_char(c) })
             .collect();
-        Self { needle, sensitive }
+        let needle_str = needle.iter().collect();
+        Self {
+            needle,
+            needle_str,
+            sensitive,
+        }
     }
 
     fn fold(&self, c: char) -> char {
@@ -1808,8 +1813,24 @@ impl SearchMatcher {
         }
     }
 
+    /// Same result as `!self.find_ranges(line).is_empty()`, without
+    /// collecting the line or the ranges (a char-sequence match is a UTF-8
+    /// substring match).
     fn contains(&self, line: &str) -> bool {
-        !self.find_ranges(line).is_empty()
+        if self.needle.is_empty() {
+            return false;
+        }
+        if self.sensitive {
+            return line.contains(self.needle_str.as_str());
+        }
+        if line.is_ascii() {
+            // `fold_char` on ASCII is `to_ascii_lowercase`; a folded ASCII
+            // line cannot contain a non-ASCII needle.
+            return self.needle_str.is_ascii()
+                && line.to_ascii_lowercase().contains(self.needle_str.as_str());
+        }
+        let folded: String = line.chars().map(fold_char).collect();
+        folded.contains(self.needle_str.as_str())
     }
 
     /// Non-overlapping match ranges as char indices `[start, end)`.
@@ -2176,6 +2197,37 @@ mod tests {
             SearchMatcher::new("日本").find_ranges("こんにちは日本"),
             vec![(5, 7)]
         );
+    }
+
+    #[test]
+    fn search_contains_agrees_with_find_ranges() {
+        const ALPHABET: &[&str] = &[
+            "a", "b", "A", "B", "z", " ", "-", "1", "é", "É", "ß", "\u{212A}", "k", "K", "İ", "i",
+            "ı", "日", "本", "ǅ", "ǆ", "e\u{301}", "Σ", "σ", "ς",
+        ];
+        fn next(seed: &mut u64, n: usize) -> usize {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            (*seed % n as u64) as usize
+        }
+        fn gen(seed: &mut u64, max_len: usize) -> String {
+            let len = next(seed, max_len);
+            (0..len)
+                .map(|_| ALPHABET[next(seed, ALPHABET.len())])
+                .collect()
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            let needle = gen(&mut seed, 4);
+            let hay = gen(&mut seed, 12);
+            let matcher = SearchMatcher::new(&needle);
+            assert_eq!(
+                matcher.contains(&hay),
+                !matcher.find_ranges(&hay).is_empty(),
+                "needle {needle:?} hay {hay:?}"
+            );
+        }
     }
 
     #[test]
